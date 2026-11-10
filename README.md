@@ -43,3 +43,5 @@ sh uninstall.sh
 ## License
 
 MIT, see [LICENSE](LICENSE). Not affiliated with Victron Energy or Phoenix Contact.
+
+Written with Claude (Anthropic).

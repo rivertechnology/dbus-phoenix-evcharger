@@ -11,6 +11,8 @@ over Modbus TCP, published as com.victronenergy.evcharger.
   setpoint current x voltage x phases while the car is in state C/D
 - Total energy counter persisted in /data so it survives restarts
 - No external Python dependencies (own minimal Modbus TCP client)
+
+Written with Claude (Anthropic). License: MIT.
 """
 
 import configparser
