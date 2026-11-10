@@ -22,7 +22,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -180,6 +180,7 @@ class PhoenixEvCharger:
         self.current_factor = d.getfloat("CurrentFactor", 1.0)
         self.min_current = d.getint("MinCurrent", 6)
         self.max_current = d.getint("MaxCurrent", 16)
+        self.default_current = d.getint("DefaultCurrent", 10)
         self.energy_mode = d.get("EnergyForward", "total").strip().lower()
         self.fail_limit = d.getint("FailuresBeforeDisconnect", 3)
 
@@ -210,6 +211,8 @@ class PhoenixEvCharger:
         self.auto_min_soc = a.getfloat("MinSoc", 40)
         self.system = system_reader
 
+        # Manual charge current: last value chosen in the GUI, else DefaultCurrent
+        self.manual_current = self._clamp_current(st.get("manual_current", self.default_current))
         self.mode = MODE_AUTO if int(st.get("mode", MODE_MANUAL)) == MODE_AUTO else MODE_MANUAL
         self._avail = None
         self._start_since = None
@@ -314,7 +317,9 @@ class PhoenixEvCharger:
             logging.error("SetCurrent write failed: %s", e)
             return False
         self.desired_current = amps
+        self.manual_current = amps
         logging.info("SetCurrent -> %d A", amps)
+        self._save(force=True)
         return True
 
     def _on_mode(self, path, value):
@@ -335,6 +340,8 @@ class PhoenixEvCharger:
             self._stop_since = None
             if self.desired_enable:
                 self._on_since = now
+            if mode == MODE_MANUAL:
+                self.desired_current = self.manual_current
             self.auto_reason = ""
             logging.info("Mode -> %s", "Auto" if mode == MODE_AUTO else "Manual")
             self._save(force=True)
@@ -471,11 +478,11 @@ class PhoenixEvCharger:
             logging.info("communication restored after %d failures", self.failures)
         self.failures = 0
 
-        # First good read: adopt what the charger has, don't override it
+        # First good read: keep the charger's on/off state, set the manual current
         if self.desired_enable is None:
             self.desired_enable = enabled
         if self.desired_current is None:
-            self.desired_current = self._clamp_current(setpoint) if setpoint else self.min_current
+            self.desired_current = self.manual_current
 
         letter = chr(raw) if 65 <= raw <= 70 else "?"
         if self.mode == MODE_AUTO:
@@ -581,6 +588,7 @@ class PhoenixEvCharger:
                 "session_kwh": round(self.session_kwh, 4),
                 "charging_time": round(self.charging_time, 1),
                 "mode": self.mode,
+                "manual_current": self.manual_current,
                 "saved_at": int(now),
             })
             self._saved_total = self.total_kwh
