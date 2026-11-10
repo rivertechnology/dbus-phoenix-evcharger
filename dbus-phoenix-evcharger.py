@@ -156,6 +156,7 @@ class PhoenixEvCharger:
         self.poll_ms = d.getint("PollIntervalMs", 2000)
         self.voltage = d.getfloat("Voltage", 230.0)
         self.phases = d.getint("Phases", 3)
+        self.current_factor = d.getfloat("CurrentFactor", 1.0)
         self.min_current = d.getint("MinCurrent", 6)
         self.max_current = d.getint("MaxCurrent", 16)
         self.energy_mode = d.get("EnergyForward", "total").strip().lower()
@@ -320,7 +321,7 @@ class PhoenixEvCharger:
             self.last_letter = letter
 
         charging = enabled and letter in ("C", "D")
-        amps = float(setpoint) if charging else 0.0
+        amps = round(float(setpoint) * self.current_factor, 2) if charging else 0.0
         p_phase = amps * self.voltage
         p_l1 = p_phase
         p_l2 = p_phase if self.phases == 3 else 0.0

@@ -4,7 +4,7 @@ Minimal Venus OS (Victron GX) driver for a **Phoenix Contact EM-CP-PP-ETH** char
 
 - Manual mode: start/stop (coil 400) and charge current (holding 300) from the GX GUI
 - Status from CP state (input register 100, ASCII A–F)
-- No energy meter: power = setpoint × voltage × phases while in state C/D; kWh integrated and persisted in `state.json`
+- No energy meter: power = setpoint × CurrentFactor × voltage × phases while in state C/D; kWh integrated and persisted in `state.json`
 - No external Python dependencies, no auto-updates
 
 ## Install on the GX
