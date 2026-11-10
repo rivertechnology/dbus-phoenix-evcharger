@@ -39,3 +39,7 @@ dbus -y com.victronenergy.evcharger.phoenix_60 /Auto/Reason GetValue
 sh restart.sh        # after editing config.ini
 sh uninstall.sh
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). Not affiliated with Victron Energy or Phoenix Contact.
