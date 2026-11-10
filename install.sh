@@ -8,7 +8,13 @@ RC_LOCAL=/data/rc.local
 LINE="$SCRIPT_DIR/install.sh"
 
 chmod 755 "$SCRIPT_DIR/dbus-phoenix-evcharger.py" "$SCRIPT_DIR/service/run" \
-          "$SCRIPT_DIR/service/log/run" "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" "$SCRIPT_DIR/restart.sh"
+          "$SCRIPT_DIR/service/log/run" "$SCRIPT_DIR"/*.sh
+
+# Local config is never overwritten; create it from the template on first install
+if [ ! -f "$SCRIPT_DIR/config.ini" ]; then
+    cp "$SCRIPT_DIR/config.default.ini" "$SCRIPT_DIR/config.ini"
+    echo "config.ini aangemaakt uit config.default.ini - controleer Host/Position."
+fi
 
 if [ ! -L "/service/$SERVICE_NAME" ]; then
     ln -s "$SCRIPT_DIR/service" "/service/$SERVICE_NAME"

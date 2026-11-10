@@ -6,7 +6,7 @@ dbus-phoenix-evcharger
 Minimal Venus OS driver for a Phoenix Contact EM-CP-PP-ETH charge controller
 over Modbus TCP, published as com.victronenergy.evcharger.
 
-- Manual mode only (start/stop + charge current from the GX GUI)
+- Manual mode (start/stop + charge current from the GX GUI) and Auto mode (PV surplus)
 - No energy meter: power and energy are CALCULATED as
   setpoint current x voltage x phases while the car is in state C/D
 - Total energy counter persisted in /data so it survives restarts
@@ -22,7 +22,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -37,7 +37,12 @@ ST_DISCONNECTED = 0
 ST_CONNECTED = 1
 ST_CHARGING = 2
 ST_CHARGED = 3
+ST_WAIT_SUN = 4
 ST_WAIT_START = 6
+ST_LOW_SOC = 7
+
+MODE_MANUAL = 0
+MODE_AUTO = 1
 ST_CP_SHORTED = 10
 
 
@@ -148,10 +153,26 @@ def save_state(state):
 
 
 # --------------------------------------------------------------------------
+# Reads values of other Venus services (grid, battery) from D-Bus
+# --------------------------------------------------------------------------
+class SystemReader:
+    def __init__(self, bus):
+        self.bus = bus
+
+    def get(self, path, service="com.victronenergy.system"):
+        try:
+            obj = self.bus.get_object(service, path, introspect=False)
+            value = obj.GetValue(dbus_interface="com.victronenergy.BusItem", timeout=1.0)
+            return float(value)  # invalid values are empty arrays -> TypeError
+        except Exception:
+            return None
+
+
+# --------------------------------------------------------------------------
 # Charger service
 # --------------------------------------------------------------------------
 class PhoenixEvCharger:
-    def __init__(self, cfg, dbus_service_cls):
+    def __init__(self, cfg, dbus_service_cls, system_reader=None):
         d = cfg["DEFAULT"]
         self.poll_ms = d.getint("PollIntervalMs", 2000)
         self.voltage = d.getfloat("Voltage", 230.0)
@@ -175,6 +196,29 @@ class PhoenixEvCharger:
         self.charging_time = float(st.get("charging_time", 0.0))
         self._saved_total = self.total_kwh
         self._last_save = time.time()
+
+        a = cfg["AUTO"] if cfg.has_section("AUTO") else cfg["DEFAULT"]
+        self.auto_start_w = a.getfloat("StartSurplusWatts", 0)  # 0 = minimum charge power + 300 W
+        self.auto_stop_import_w = a.getfloat("StopImportWatts", 500)
+        self.auto_start_delay = a.getfloat("StartDelaySeconds", 60)
+        self.auto_stop_delay = a.getfloat("StopDelaySeconds", 180)
+        self.auto_min_runtime = a.getfloat("MinRuntimeSeconds", 300)
+        self.auto_min_offtime = a.getfloat("MinOfftimeSeconds", 300)
+        self.auto_adjust_interval = a.getfloat("AdjustIntervalSeconds", 20)
+        self.auto_alpha = a.getfloat("SmoothingAlpha", 0.3)
+        self.auto_use_battery = a.getboolean("UseBattery", True)
+        self.auto_min_soc = a.getfloat("MinSoc", 40)
+        self.system = system_reader
+
+        self.mode = MODE_AUTO if int(st.get("mode", MODE_MANUAL)) == MODE_AUTO else MODE_MANUAL
+        self._avail = None
+        self._start_since = None
+        self._stop_since = None
+        self._on_since = 0.0
+        self._off_since = 0.0
+        self._last_adjust = 0.0
+        self.auto_reason = ""
+        self._low_soc = False
 
         self.desired_enable = None
         self.desired_current = None
@@ -221,7 +265,9 @@ class PhoenixEvCharger:
         svc.add_path("/SetCurrent", self.min_current, writeable=True,
                      onchangecallback=self._on_set_current, gettextcallback=_a)
         svc.add_path("/StartStop", 0, writeable=True, onchangecallback=self._on_start_stop)
-        svc.add_path("/Mode", 0, writeable=True, onchangecallback=self._on_mode)
+        svc.add_path("/Mode", self.mode, writeable=True, onchangecallback=self._on_mode)
+        svc.add_path("/Auto/AvailableWatts", None, gettextcallback=_w)
+        svc.add_path("/Auto/Reason", "")
         svc.add_path("/AutoStart", 0, writeable=True)
         svc.add_path("/Status", ST_DISCONNECTED)
         svc.add_path("/ChargingTime", int(self.charging_time), gettextcallback=_s)
@@ -244,6 +290,9 @@ class PhoenixEvCharger:
 
     # ---- D-Bus write callbacks -------------------------------------------
     def _on_start_stop(self, path, value):
+        if self.mode == MODE_AUTO:
+            logging.info("StartStop ignored: Auto mode is active")
+            return False
         try:
             enable = bool(int(value))
             self.mb.write_coil(self.coil_enable, enable)
@@ -255,6 +304,9 @@ class PhoenixEvCharger:
         return True
 
     def _on_set_current(self, path, value):
+        if self.mode == MODE_AUTO:
+            logging.info("SetCurrent ignored: Auto mode is active")
+            return False
         try:
             amps = self._clamp_current(value)
             self.mb.write_register(self.reg_current, amps)
@@ -266,8 +318,131 @@ class PhoenixEvCharger:
         return True
 
     def _on_mode(self, path, value):
-        # Only Manual (0) is supported
-        return int(value) == 0
+        try:
+            mode = int(value)
+        except (TypeError, ValueError):
+            return False
+        if mode not in (MODE_MANUAL, MODE_AUTO):
+            return False  # Scheduled (2) not supported
+        if mode == MODE_AUTO and self.system is None:
+            logging.error("Auto mode unavailable: no system reader")
+            return False
+        if mode != self.mode:
+            now = time.time()
+            self.mode = mode
+            self._avail = None
+            self._start_since = None
+            self._stop_since = None
+            if self.desired_enable:
+                self._on_since = now
+            self.auto_reason = ""
+            logging.info("Mode -> %s", "Auto" if mode == MODE_AUTO else "Manual")
+            self._save(force=True)
+        return True
+
+    # ---- Auto mode (PV surplus) ------------------------------------------
+    def _read_surplus(self, charge_w):
+        """Available power for the car in W (incl. what it already uses), or None."""
+        get = self.system.get
+        self._low_soc = False
+        phases = [get("/Ac/Grid/L%d/Power" % i) for i in (1, 2, 3)]
+        phases = [p for p in phases if p is not None]
+        if not phases:
+            return None
+        available = -sum(phases) + charge_w
+        if self.auto_use_battery:
+            batt_p = get("/Dc/Battery/Power")
+            soc = get("/Dc/Battery/Soc")
+            self._low_soc = soc is not None and soc < self.auto_min_soc
+            if batt_p is not None:
+                # Battery charging counts as surplus only above MinSoc;
+                # battery discharging always counts against the car.
+                available += min(batt_p, 0.0) if self._low_soc else batt_p
+        return available
+
+    def _auto_control(self, letter, enabled, charge_w, now):
+        if letter not in ("B", "C", "D"):
+            if self.desired_enable:
+                logging.info("Auto: car disconnected, disabling")
+                self.desired_enable = False
+                self._off_since = now
+            self._avail = None
+            self._start_since = self._stop_since = None
+            self.auto_reason = "no car"
+            self.svc["/Auto/AvailableWatts"] = None
+            return
+
+        available = self._read_surplus(charge_w)
+        w_per_amp = self.voltage * self.phases * self.current_factor
+        min_w = self.min_current * w_per_amp
+
+        if available is None:
+            self._avail = None
+            self.svc["/Auto/AvailableWatts"] = None
+            self.auto_reason = "no grid data"
+            if enabled:
+                self._stop_since = self._stop_since or now
+                if now - self._stop_since >= self.auto_stop_delay:
+                    logging.warning("Auto: no grid data, stopping")
+                    self.desired_enable = False
+                    self._off_since = now
+            return
+
+        a = self.auto_alpha
+        self._avail = available if self._avail is None else a * available + (1 - a) * self._avail
+        avg = self._avail
+        self.svc["/Auto/AvailableWatts"] = round(avg)
+
+        if not enabled:
+            start_w = self.auto_start_w or (min_w + 300)
+            if self._low_soc:
+                self.auto_reason = "battery below MinSoc"
+                self._start_since = None
+            elif now - self._off_since < self.auto_min_offtime:
+                self.auto_reason = "min off-time"
+                self._start_since = None
+            elif avg < start_w:
+                self.auto_reason = "waiting for %d W surplus" % start_w
+                self._start_since = None
+            else:
+                self._start_since = self._start_since or now
+                self.auto_reason = "starting"
+                if now - self._start_since >= self.auto_start_delay:
+                    amps = self._clamp_current(int(avg // w_per_amp))
+                    logging.info("Auto: start, surplus %d W -> %d A", avg, amps)
+                    self.desired_current = amps
+                    self.desired_enable = True
+                    self._on_since = self._last_adjust = now
+                    self._start_since = None
+            return
+
+        # Charging: follow the surplus, stop after a sustained deficit
+        target = int(avg // w_per_amp)
+        if target >= self.min_current and not self._low_soc:
+            self._stop_since = None
+            new = self._clamp_current(target)
+            self.auto_reason = "following surplus"
+            if new != self.desired_current and now - self._last_adjust >= self.auto_adjust_interval:
+                logging.info("Auto: adjust %s -> %d A (surplus %d W)", self.desired_current, new, avg)
+                self.desired_current = new
+                self._last_adjust = now
+            return
+
+        if self.desired_current != self.min_current:
+            self.desired_current = self.min_current
+            self._last_adjust = now
+        deficit = min_w - avg
+        if deficit > self.auto_stop_import_w or self._low_soc:
+            self._stop_since = self._stop_since or now
+            self.auto_reason = "low surplus" if not self._low_soc else "battery below MinSoc"
+            if now - self._stop_since >= self.auto_stop_delay and now - self._on_since >= self.auto_min_runtime:
+                logging.info("Auto: stop, surplus %d W (%s)", avg, self.auto_reason)
+                self.desired_enable = False
+                self._off_since = now
+                self._stop_since = None
+        else:
+            self._stop_since = None
+            self.auto_reason = "minimum current"
 
     # ---- polling ---------------------------------------------------------
     def update(self):
@@ -302,20 +477,28 @@ class PhoenixEvCharger:
         if self.desired_current is None:
             self.desired_current = self._clamp_current(setpoint) if setpoint else self.min_current
 
+        letter = chr(raw) if 65 <= raw <= 70 else "?"
+        if self.mode == MODE_AUTO:
+            cur_w = setpoint * self.current_factor * self.voltage * self.phases \
+                if (enabled and letter in ("C", "D")) else 0.0
+            self._auto_control(letter, enabled, cur_w, now)
+            self.svc["/Auto/Reason"] = self.auto_reason
+        else:
+            self.svc["/Auto/Reason"] = ""
+
         # Re-assert desired values if the charger lost them (e.g. after its own reboot)
         try:
             if enabled != self.desired_enable:
-                logging.info("re-asserting enable=%d (charger reports %d)", self.desired_enable, enabled)
+                logging.info("write enable=%d (charger had %d)", self.desired_enable, enabled)
                 self.mb.write_coil(self.coil_enable, self.desired_enable)
                 enabled = self.desired_enable
             if setpoint != self.desired_current:
-                logging.info("re-asserting current=%d A (charger reports %d A)", self.desired_current, setpoint)
+                logging.info("write current=%d A (charger had %d A)", self.desired_current, setpoint)
                 self.mb.write_register(self.reg_current, self.desired_current)
                 setpoint = self.desired_current
         except ModbusError as e:
-            logging.warning("re-assert failed: %s", e)
+            logging.warning("write failed: %s", e)
 
-        letter = chr(raw) if 65 <= raw <= 70 else "?"
         if letter != self.last_letter:
             logging.info("CP state %s -> %s", self.last_letter, letter)
             self.last_letter = letter
@@ -350,7 +533,9 @@ class PhoenixEvCharger:
         elif charging:
             status = ST_CHARGING
         elif letter == "B":
-            if not enabled:
+            if not enabled and self.mode == MODE_AUTO:
+                status = ST_LOW_SOC if self._low_soc else ST_WAIT_SUN
+            elif not enabled:
                 status = ST_WAIT_START
             elif self.session_kwh > 0.01:
                 status = ST_CHARGED
@@ -395,6 +580,7 @@ class PhoenixEvCharger:
                 "total_kwh": round(self.total_kwh, 4),
                 "session_kwh": round(self.session_kwh, 4),
                 "charging_time": round(self.charging_time, 1),
+                "mode": self.mode,
                 "saved_at": int(now),
             })
             self._saved_total = self.total_kwh
@@ -425,8 +611,10 @@ def main():
     from dbus.mainloop.glib import DBusGMainLoop  # noqa: E402
     from gi.repository import GLib  # noqa: E402
 
+    import dbus  # noqa: E402
     DBusGMainLoop(set_as_default=True)
-    charger = PhoenixEvCharger(cfg, VeDbusService)
+    bus = dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else dbus.SystemBus()
+    charger = PhoenixEvCharger(cfg, VeDbusService, SystemReader(bus))
     GLib.timeout_add(charger.poll_ms, charger.update)
 
     loop = GLib.MainLoop()
