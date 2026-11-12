@@ -7,8 +7,9 @@ Minimal Venus OS driver for a Phoenix Contact EM-CP-PP-ETH charge controller
 over Modbus TCP, published as com.victronenergy.evcharger.
 
 - Manual mode (start/stop + charge current from the GX GUI) and Auto mode (PV surplus)
-- No energy meter: power and energy are CALCULATED as
-  setpoint current x voltage x phases while the car is in state C/D
+- Optional Eastron SDM72D-M (MID) meter via a Modbus TCP gateway for real
+  power, current, voltage and kWh; without it power and energy are CALCULATED
+  as setpoint current x CurrentFactor x voltage x phases in state C/D
 - Total energy counter persisted in /data so it survives restarts
 - No external Python dependencies (own minimal Modbus TCP client)
 
@@ -24,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -134,6 +135,48 @@ class ModbusTcp:
 
 
 # --------------------------------------------------------------------------
+# Eastron SDM72D-M energy meter (input registers, float32), via Modbus TCP gateway
+# --------------------------------------------------------------------------
+class Sdm72Meter:
+    def __init__(self, sec):
+        self.mb = ModbusTcp(sec.get("Host").strip(), sec.getint("Port", 502),
+                            sec.getint("UnitId", 1), sec.getfloat("TimeoutSeconds", 2.0))
+        self.swap_words = sec.get("WordOrder", "big").strip().lower() == "little"
+        self.reg_phase = sec.getint("PhaseBlockRegister", 0)      # V1..3, I1..3, P1..3
+        self.reg_total_p = sec.getint("TotalPowerRegister", 52)
+        self.reg_energy = sec.getint("EnergyRegister", 72)        # total import kWh
+        self.last_kwh = None
+
+    def _floats(self, addr, count):
+        regs = self.mb.read_input(addr, 2 * count)
+        out = []
+        for i in range(count):
+            hi, lo = regs[2 * i], regs[2 * i + 1]
+            if self.swap_words:
+                hi, lo = lo, hi
+            v = struct.unpack(">f", struct.pack(">HH", hi, lo))[0]
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ModbusError("meter returned NaN/inf at register %d" % (addr + 2 * i))
+            out.append(v)
+        return out
+
+    def read(self):
+        ph = self._floats(self.reg_phase, 9)
+        if not any(100.0 <= v <= 300.0 for v in ph[0:3]):
+            raise ModbusError("implausible voltages %s - check UnitId, WordOrder and registers"
+                              % ", ".join("%.4g" % v for v in ph[0:3]))
+        total_p = self._floats(self.reg_total_p, 1)[0]
+        kwh = self._floats(self.reg_energy, 1)[0]
+        if kwh < 0 or (self.last_kwh is not None and kwh < self.last_kwh - 0.01):
+            raise ModbusError("implausible energy reading %.3f kWh (last %.3f)" % (kwh, self.last_kwh or 0))
+        self.last_kwh = kwh
+        return {"v": ph[0:3], "i": ph[3:6], "p": ph[6:9], "p_total": total_p, "kwh": kwh}
+
+    def close(self):
+        self.mb.close()
+
+
+# --------------------------------------------------------------------------
 # Persistent state (energy counter)
 # --------------------------------------------------------------------------
 def load_state():
@@ -193,7 +236,13 @@ class PhoenixEvCharger:
         self.mb = ModbusTcp(m.get("Host"), m.getint("Port", 502),
                             m.getint("UnitId", 180), m.getfloat("TimeoutSeconds", 2.0))
 
+        mt = cfg["METER"] if cfg.has_section("METER") else None
+        self.meter = Sdm72Meter(mt) if mt is not None and mt.get("Host", "").strip() else None
+        self.meter_failures = 0
+        self.meter_ok = False
+
         st = load_state()
+        self.session_start_kwh = st.get("session_start_kwh")
         self.total_kwh = float(st.get("total_kwh", 0.0))
         self.session_kwh = float(st.get("session_kwh", 0.0))
         self.charging_time = float(st.get("charging_time", 0.0))
@@ -243,7 +292,10 @@ class PhoenixEvCharger:
 
         svc.add_path("/Mgmt/ProcessName", __file__)
         svc.add_path("/Mgmt/ProcessVersion", VERSION + " on Python " + sys.version.split()[0])
-        svc.add_path("/Mgmt/Connection", "Modbus TCP %s unit %d" % (self.mb.host, self.mb.unit))
+        conn = "Modbus TCP %s unit %d" % (self.mb.host, self.mb.unit)
+        if self.meter:
+            conn += ", SDM72D-M %s unit %d" % (self.meter.mb.host, self.meter.mb.unit)
+        svc.add_path("/Mgmt/Connection", conn)
         svc.add_path("/DeviceInstance", instance)
         svc.add_path("/ProductId", 0xFFFF)
         svc.add_path("/ProductName", "Phoenix Contact EV Charger")
@@ -265,6 +317,13 @@ class PhoenixEvCharger:
         svc.add_path("/Ac/L2/Power", 0, gettextcallback=_w)
         svc.add_path("/Ac/L3/Power", 0, gettextcallback=_w)
         svc.add_path("/Ac/Energy/Forward", self._energy_value(), gettextcallback=_k)
+        _v = lambda p, v: "%.1f V" % v if v is not None else ""
+        _a1 = lambda p, v: "%.1f A" % v if v is not None else ""
+        for i in (1, 2, 3):
+            svc.add_path("/Ac/L%d/Voltage" % i, None, gettextcallback=_v)
+            svc.add_path("/Ac/L%d/Current" % i, None, gettextcallback=_a1)
+        svc.add_path("/Meter/Connected", 0)
+        svc.add_path("/Meter/Source", "SDM72D-M" if self.meter else "calculated")
         svc.add_path("/Current", 0, gettextcallback=_a)
         svc.add_path("/MaxCurrent", self.max_current, gettextcallback=_a)
         svc.add_path("/SetCurrent", self.min_current, writeable=True,
@@ -487,9 +546,13 @@ class PhoenixEvCharger:
             self.desired_current = self.manual_current
 
         letter = chr(raw) if 65 <= raw <= 70 else "?"
+        meas = self._read_meter()
         if self.mode == MODE_AUTO:
-            cur_w = setpoint * self.current_factor * self.voltage * self.phases \
-                if (enabled and letter in ("C", "D")) else 0.0
+            if meas is not None:
+                cur_w = max(meas["p_total"], 0.0)
+            else:
+                cur_w = setpoint * self.current_factor * self.voltage * self.phases \
+                    if (enabled and letter in ("C", "D")) else 0.0
             self._auto_control(letter, enabled, cur_w, now)
             self.svc["/Auto/Reason"] = self.auto_reason
         else:
@@ -513,28 +576,49 @@ class PhoenixEvCharger:
             self.last_letter = letter
 
         charging = enabled and letter in ("C", "D")
-        amps = round(float(setpoint) * self.current_factor, 2) if charging else 0.0
-        p_phase = amps * self.voltage
-        p_l1 = p_phase
-        p_l2 = p_phase if self.phases == 3 else 0.0
-        p_l3 = p_phase if self.phases == 3 else 0.0
-        p_total = p_l1 + p_l2 + p_l3
+        if meas is not None:
+            p_l1, p_l2, p_l3 = meas["p"]
+            p_total = meas["p_total"]
+            amps = round(max(meas["i"]), 2)
+        else:
+            amps = round(float(setpoint) * self.current_factor, 2) if charging else 0.0
+            p_phase = amps * self.voltage
+            p_l1 = p_phase
+            p_l2 = p_phase if self.phases == 3 else 0.0
+            p_l3 = p_phase if self.phases == 3 else 0.0
+            p_total = p_l1 + p_l2 + p_l3
 
-        # Integrate calculated energy (skip big gaps, e.g. after comm loss)
+        dt = None
         if self.last_update is not None:
             dt = now - self.last_update
-            if 0 < dt <= 5 * self.poll_ms / 1000.0:
-                kwh = p_total * dt / 3600000.0
-                self.total_kwh += kwh
-                self.session_kwh += kwh
-                if charging:
-                    self.charging_time += dt
+            if not 0 < dt <= 5 * self.poll_ms / 1000.0:
+                dt = None  # skip big gaps, e.g. after comm loss
         self.last_update = now
+        if dt and charging:
+            self.charging_time += dt
+
+        if meas is not None:
+            # Energy straight from the MID meter
+            kwh = meas["kwh"]
+            if self.session_start_kwh is None or self.session_start_kwh > kwh:
+                self.session_start_kwh = kwh - (self.session_kwh if self.session_kwh <= kwh else 0.0)
+            if abs(self.total_kwh - kwh) > 0.5:
+                logging.info("energy counter now from meter: %.2f kWh (was %.2f)", kwh, self.total_kwh)
+            self.total_kwh = kwh
+            self.session_kwh = max(0.0, kwh - self.session_start_kwh)
+        elif self.meter is None and dt:
+            # No meter configured: integrate calculated energy
+            kwh = p_total * dt / 3600000.0
+            self.total_kwh += kwh
+            self.session_kwh += kwh
+        # Meter configured but not readable: keep energy frozen until it is back
 
         # New session when the car is unplugged
         if letter == "A" and (self.session_kwh or self.charging_time):
             self.session_kwh = 0.0
             self.charging_time = 0.0
+            if meas is not None:
+                self.session_start_kwh = meas["kwh"]
             self._save(force=True)
 
         if letter == "A":
@@ -568,8 +652,30 @@ class PhoenixEvCharger:
         s["/Status"] = status
         s["/ChargingTime"] = int(self.charging_time)
         s["/Ac/Energy/Forward"] = self._energy_value()
+        for i in (1, 2, 3):
+            s["/Ac/L%d/Voltage" % i] = round(meas["v"][i - 1], 1) if meas else None
+            s["/Ac/L%d/Current" % i] = round(meas["i"][i - 1], 2) if meas else None
+        s["/Meter/Connected"] = 1 if meas else 0
 
         self._save()
+
+    def _read_meter(self):
+        if self.meter is None:
+            return None
+        try:
+            meas = self.meter.read()
+        except ModbusError as e:
+            self.meter_failures += 1
+            if self.meter_failures == 1 or self.meter_failures % 30 == 0:
+                logging.warning("meter read failed (%d), using calculated power: %s", self.meter_failures, e)
+            self.meter_ok = False
+            return None
+        if not self.meter_ok:
+            logging.info("meter OK: %.1f/%.1f/%.1f V, %.0f W, %.3f kWh",
+                         meas["v"][0], meas["v"][1], meas["v"][2], meas["p_total"], meas["kwh"])
+        self.meter_ok = True
+        self.meter_failures = 0
+        return meas
 
     def _publish_offline(self):
         s = self.svc
@@ -579,6 +685,7 @@ class PhoenixEvCharger:
         s["/Ac/L2/Power"] = 0
         s["/Ac/L3/Power"] = 0
         s["/Current"] = 0
+        s["/Meter/Connected"] = 0
 
     def _save(self, force=False):
         # Limit flash writes: at most once per 5 minutes, or on 0.1 kWh change
@@ -591,6 +698,7 @@ class PhoenixEvCharger:
                 "charging_time": round(self.charging_time, 1),
                 "mode": self.mode,
                 "manual_current": self.manual_current,
+                "session_start_kwh": None if self.session_start_kwh is None else round(self.session_start_kwh, 4),
                 "saved_at": int(now),
             })
             self._saved_total = self.total_kwh
@@ -599,9 +707,35 @@ class PhoenixEvCharger:
     def shutdown(self):
         self._save(force=True)
         self.mb.close()
+        if self.meter:
+            self.meter.close()
 
 
 # --------------------------------------------------------------------------
+def test_meter(cfg, args):
+    """Read the meter once with both word orders: python3 dbus-phoenix-evcharger.py --test-meter [host]"""
+    sec = cfg["METER"]
+    if args:
+        sec["Host"] = args[0]
+    if not sec.get("Host", "").strip():
+        print("Geen meter: zet Host onder [METER] in config.ini, of geef het IP mee als argument.")
+        return 1
+    ok = False
+    for order in ("big", "little"):
+        sec["WordOrder"] = order
+        m = Sdm72Meter(sec)
+        try:
+            r = m.read()
+            ok = True
+            print("WordOrder=%-6s OK  U=%.1f/%.1f/%.1f V  I=%.2f/%.2f/%.2f A  P=%.0f W  import=%.3f kWh" % (
+                order, *r["v"], *r["i"], r["p_total"], r["kwh"]))
+        except ModbusError as e:
+            print("WordOrder=%-6s --  %s" % (order, e))
+        finally:
+            m.close()
+    return 0 if ok else 1
+
+
 def main():
     cfg = configparser.ConfigParser()
     if not cfg.read(CONFIG_PATH):
@@ -612,6 +746,9 @@ def main():
         format="%(levelname)s %(message)s",
         level=getattr(logging, cfg["DEFAULT"].get("Logging", "INFO").upper(), logging.INFO),
     )
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-meter":
+        sys.exit(test_meter(cfg, sys.argv[2:]))
 
     for p in VELIB_PATHS:
         if os.path.isdir(p):

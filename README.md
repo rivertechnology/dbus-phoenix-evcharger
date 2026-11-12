@@ -5,7 +5,8 @@ Lightweight Venus OS (Victron GX) driver for a **Phoenix Contact EM-CP-PP-ETH** 
 - **Manual mode**: start/stop (coil 400) and charge current (holding 300) from the GX GUI
 - **Auto mode**: charge on PV surplus (grid export + battery charge power above `MinSoc`), current follows the surplus between `MinCurrent` and `MaxCurrent`, with start/stop delays, minimum runtime and off-time
 - Status from CP state (input register 100, ASCII A–F)
-- No energy meter: power = setpoint × `CurrentFactor` × voltage × phases while in state C/D; total kWh persisted in `state.json`
+- Optional **Eastron SDM72D-M (MID)** via a Modbus TCP gateway (`[METER]` in `config.ini`): real power, current, voltage and the meter's import kWh
+- Without a meter: power = setpoint × `CurrentFactor` × voltage × phases while in state C/D; total kWh persisted in `state.json`
 - No external Python dependencies, **no automatic updates**
 
 ## Install on the GX
@@ -21,6 +22,19 @@ sh restart.sh
 ```
 
 Enable *Settings → General → Modification checks → custom scripts* in the GX GUI, otherwise `/data/rc.local` is disabled after a firmware update.
+
+## Energy meter (SDM72D-M)
+
+Connect the meter's RS485 to a Modbus RTU→TCP gateway (9600 8N1, meter address 1), then:
+
+```sh
+cd /data/dbus-phoenix-evcharger
+python3 dbus-phoenix-evcharger.py --test-meter 192.168.178.xx   # try both word orders
+nano config.ini      # [METER] Host=192.168.178.xx (and WordOrder if needed)
+sh restart.sh
+```
+
+If the meter can't be read, the driver falls back to calculated power and freezes the kWh counter until the meter is back.
 
 ## Update
 
