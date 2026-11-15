@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -335,6 +335,9 @@ class PhoenixEvCharger:
         svc.add_path("/AutoStart", 0, writeable=True)
         svc.add_path("/Status", ST_DISCONNECTED)
         svc.add_path("/ChargingTime", int(self.charging_time), gettextcallback=_s)
+        # gui-v2 shows session energy/time from these paths
+        svc.add_path("/Session/Energy", round(self.session_kwh, 3), gettextcallback=_k)
+        svc.add_path("/Session/Time", int(self.charging_time), gettextcallback=_s)
         svc.add_path("/EnableDisplay", 0, writeable=True)
         svc.add_path("/Phoenix/CpState", "")
 
@@ -651,6 +654,8 @@ class PhoenixEvCharger:
         s["/StartStop"] = int(enabled)
         s["/Status"] = status
         s["/ChargingTime"] = int(self.charging_time)
+        s["/Session/Energy"] = round(self.session_kwh, 3)
+        s["/Session/Time"] = int(self.charging_time)
         s["/Ac/Energy/Forward"] = self._energy_value()
         for i in (1, 2, 3):
             s["/Ac/L%d/Voltage" % i] = round(meas["v"][i - 1], 1) if meas else None
