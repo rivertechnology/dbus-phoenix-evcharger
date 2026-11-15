@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -145,7 +145,18 @@ class Sdm72Meter:
         self.reg_phase = sec.getint("PhaseBlockRegister", 0)      # V1..3, I1..3, P1..3
         self.reg_total_p = sec.getint("TotalPowerRegister", 52)
         self.reg_energy = sec.getint("EnergyRegister", 72)        # total import kWh
+        self.reg_serial = sec.getint("SerialRegister", 0xFC00)    # holding, uint32 (newer Eastron)
         self.last_kwh = None
+        self.serial = None
+
+    def read_serial(self):
+        """Meter serial number, or None if the meter doesn't expose it."""
+        try:
+            hi, lo = self.mb.read_holding(self.reg_serial, 2)
+        except ModbusError:
+            return None
+        sn = (hi << 16) | lo
+        return str(sn) if 0 < sn < 0xFFFFFFFF else None
 
     def _floats(self, addr, count):
         regs = self.mb.read_input(addr, 2 * count)
@@ -324,6 +335,7 @@ class PhoenixEvCharger:
             svc.add_path("/Ac/L%d/Current" % i, None, gettextcallback=_a1)
         svc.add_path("/Meter/Connected", 0)
         svc.add_path("/Meter/Source", "SDM72D-M" if self.meter else "calculated")
+        svc.add_path("/Meter/Serial", "")
         svc.add_path("/Current", 0, gettextcallback=_a)
         svc.add_path("/MaxCurrent", self.max_current, gettextcallback=_a)
         svc.add_path("/SetCurrent", self.min_current, writeable=True,
@@ -678,6 +690,12 @@ class PhoenixEvCharger:
         if not self.meter_ok:
             logging.info("meter OK: %.1f/%.1f/%.1f V, %.0f W, %.3f kWh",
                          meas["v"][0], meas["v"][1], meas["v"][2], meas["p_total"], meas["kwh"])
+            if self.meter.serial is None:
+                self.meter.serial = self.meter.read_serial() or ""
+                logging.info("meter serial: %s", self.meter.serial or "not available via Modbus")
+                self.svc["/Meter/Serial"] = self.meter.serial
+                if self.meter.serial:
+                    self.svc["/Serial"] = self.meter.serial
         self.meter_ok = True
         self.meter_failures = 0
         return meas
@@ -736,6 +754,7 @@ def test_meter(cfg, args):
             ok = True
             print("WordOrder=%-6s OK  U=%.1f/%.1f/%.1f V  I=%.2f/%.2f/%.2f A  P=%.0f W  import=%.3f kWh" % (
                 order, *r["v"], *r["i"], r["p_total"], r["kwh"]))
+            print("                 serienummer: %s" % (m.read_serial() or "niet uit te lezen via Modbus"))
         except ModbusError as e:
             print("WordOrder=%-6s --  %s" % (order, e))
         finally:
