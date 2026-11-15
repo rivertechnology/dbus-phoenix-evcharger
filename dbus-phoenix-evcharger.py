@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -740,8 +740,18 @@ def test_meter(cfg, args):
 
 def main():
     cfg = configparser.ConfigParser()
-    if not cfg.read(CONFIG_PATH):
+    try:
+        found = cfg.read(CONFIG_PATH)
+    except configparser.Error as e:
+        print("FOUT in config.ini: %s" % str(e).replace("\n", " "))
+        print("Pas config.ini aan en draai daarna restart.sh. Nieuwe poging over 60 s.")
+        sys.stdout.flush()
+        time.sleep(60)  # avoid a fast restart loop under runit
+        sys.exit(1)
+    if not found:
         print("config.ini not found at %s" % CONFIG_PATH)
+        sys.stdout.flush()
+        time.sleep(60)
         sys.exit(1)
 
     logging.basicConfig(
