@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -714,6 +714,8 @@ class PhoenixEvCharger:
 # --------------------------------------------------------------------------
 def test_meter(cfg, args):
     """Read the meter once with both word orders: python3 dbus-phoenix-evcharger.py --test-meter [host]"""
+    if not cfg.has_section("METER"):
+        cfg.add_section("METER")  # older config.ini without a [METER] block
     sec = cfg["METER"]
     if args:
         sec["Host"] = args[0]
