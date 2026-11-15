@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -244,8 +244,8 @@ class PhoenixEvCharger:
         self.reg_status = m.getint("StatusInputRegister", 100)
         self.reg_current = m.getint("CurrentHoldingRegister", 300)
         self.coil_enable = m.getint("EnableCoil", 400)
-        # Phoenix withdraws the charge release if it isn't refreshed: rewrite periodically
-        self.keepalive_s = m.getfloat("KeepAliveSeconds", 10)
+        # Optional periodic rewrite of release + current (0 = off; Phoenix needs no refresh)
+        self.keepalive_s = m.getfloat("KeepAliveSeconds", 0)
         self._last_keepalive = 0.0
         self.mb = ModbusTcp(m.get("Host"), m.getint("Port", 502),
                             m.getint("UnitId", 180), m.getfloat("TimeoutSeconds", 2.0))
