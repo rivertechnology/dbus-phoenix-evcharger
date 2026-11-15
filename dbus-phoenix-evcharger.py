@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -244,6 +244,9 @@ class PhoenixEvCharger:
         self.reg_status = m.getint("StatusInputRegister", 100)
         self.reg_current = m.getint("CurrentHoldingRegister", 300)
         self.coil_enable = m.getint("EnableCoil", 400)
+        # Phoenix withdraws the charge release if it isn't refreshed: rewrite periodically
+        self.keepalive_s = m.getfloat("KeepAliveSeconds", 10)
+        self._last_keepalive = 0.0
         self.mb = ModbusTcp(m.get("Host"), m.getint("Port", 502),
                             m.getint("UnitId", 180), m.getfloat("TimeoutSeconds", 2.0))
 
@@ -575,10 +578,17 @@ class PhoenixEvCharger:
 
         # Re-assert desired values if the charger lost them (e.g. after its own reboot)
         try:
+            if self.keepalive_s > 0 and self.desired_enable and enabled \
+                    and setpoint == self.desired_current and now - self._last_keepalive >= self.keepalive_s:
+                # keep-alive: refresh release and current before the charger's watchdog expires
+                self.mb.write_coil(self.coil_enable, True)
+                self.mb.write_register(self.reg_current, self.desired_current)
+                self._last_keepalive = now
             if enabled != self.desired_enable:
                 logging.info("write enable=%d (charger had %d)", self.desired_enable, enabled)
                 self.mb.write_coil(self.coil_enable, self.desired_enable)
                 enabled = self.desired_enable
+                self._last_keepalive = now
             if setpoint != self.desired_current:
                 logging.info("write current=%d A (charger had %d A)", self.desired_current, setpoint)
                 self.mb.write_register(self.reg_current, self.desired_current)
