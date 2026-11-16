@@ -211,6 +211,7 @@ class OcppClient:
         self.require_meter = sec.getboolean("RequireMeter", True)
         self.mv_interval = max(10, sec.getint("MeterValueSampleInterval", 60))
         self.hb_interval = max(30, sec.getint("HeartbeatInterval", 300))
+        self.ping_interval = max(0, sec.getint("WebSocketPingInterval", 60))   # 0 = off
         self.state_path = state_path
         self.info = info                    # vendor, model, firmware, meter type
         self.ws_factory = ws_factory
@@ -233,6 +234,7 @@ class OcppClient:
         self._last_hb = 0.0
         self._last_mv = 0.0
         self._last_rx = 0.0
+        self._last_ping = 0.0
         self._boot_retry_at = 0.0
         self._warned_meter = False
 
@@ -342,6 +344,7 @@ class OcppClient:
         self._inflight_queued = None
         self._last_status = None
         self._last_rx = now
+        self._last_ping = now
         log.info("OCPP connected to %s", mask_url(self.url))
         self._boot(now)
 
@@ -443,6 +446,7 @@ class OcppClient:
     def _handle_call(self, mid, action, payload):
         cfg = {"HeartbeatInterval": str(self.hb_interval),
                "MeterValueSampleInterval": str(self.mv_interval),
+               "WebSocketPingInterval": str(self.ping_interval),
                "MeterValuesSampledData": "Energy.Active.Import.Register,Power.Active.Import,Current.Import,Voltage",
                "NumberOfConnectors": "1",
                "AuthorizeRemoteTxRequests": "false",
@@ -452,7 +456,7 @@ class OcppClient:
                "SupportedFeatureProfiles": "Core,RemoteTrigger"}
         if action == "GetConfiguration":
             keys = payload.get("key") or list(cfg)
-            known = [{"key": k, "readonly": k not in ("HeartbeatInterval", "MeterValueSampleInterval"),
+            known = [{"key": k, "readonly": k not in ("HeartbeatInterval", "MeterValueSampleInterval", "WebSocketPingInterval"),
                       "value": cfg[k]} for k in keys if k in cfg]
             unknown = [k for k in keys if k not in cfg]
             res = {"configurationKey": known}
@@ -461,9 +465,11 @@ class OcppClient:
             self._reply(mid, res)
         elif action == "ChangeConfiguration":
             key, value = payload.get("key"), str(payload.get("value", ""))
-            if key in ("HeartbeatInterval", "MeterValueSampleInterval") and value.isdigit():
+            if key in ("HeartbeatInterval", "MeterValueSampleInterval", "WebSocketPingInterval") and value.isdigit():
                 if key == "HeartbeatInterval":
                     self.hb_interval = max(30, int(value))
+                elif key == "WebSocketPingInterval":
+                    self.ping_interval = int(value)
                 else:
                     self.mv_interval = max(10, int(value))
                 log.info("OCPP %s set to %s by server", key, value)
@@ -587,6 +593,9 @@ class OcppClient:
 
     # ---- outgoing -----------------------------------------------------------
     def _send_due(self, snap, now):
+        if self.ping_interval and now - self._last_ping >= self.ping_interval:
+            self.ws.ping()
+            self._last_ping = now
         if not self.accepted:
             if now >= self._boot_retry_at and not any(a == "BootNotification" for a, *_ in self._pending.values()):
                 self._boot(now)

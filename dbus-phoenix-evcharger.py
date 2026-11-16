@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
