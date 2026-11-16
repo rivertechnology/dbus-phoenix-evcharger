@@ -315,10 +315,10 @@ if not (cfg_ok and cfg.has_section("OCPP") and cfg["OCPP"].getboolean("Enabled",
     ok("OCPP staat uit")
 else:
     oc_sec = cfg["OCPP"]
-    url = oc_sec.get("Url", "").strip()
+    url = oc_sec.get("Url", "", raw=True).strip()
     if not url.startswith("wss://"):
         (err if not url else warn)("[OCPP] Url %s" % ("ontbreekt" if not url else "gebruikt geen wss:// (onversleuteld)"))
-    has_key = bool(oc_sec.get("AuthKey", "").strip()) or ("auth=" in url and not url.endswith("auth="))
+    has_key = bool(oc_sec.get("AuthKey", "", raw=True).strip()) or ("auth=" in url and not url.endswith("auth="))
     (ok if has_key else err)("sleutel (auth) %s" % ("ingevuld" if has_key else "ontbreekt"))
     if not meter_host and oc_sec.getboolean("RequireMeter", True):
         err("OCPP met RequireMeter=1 maar geen meter: er worden geen sessies doorgegeven")

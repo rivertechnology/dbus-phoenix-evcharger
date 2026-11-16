@@ -205,7 +205,8 @@ class WebSocket:
 # --------------------------------------------------------------------------
 class OcppClient:
     def __init__(self, sec, state_path, info, ws_factory=WebSocket, clock=time.time):
-        self.url = build_url(sec.get("Url", ""), sec.get("AuthKey", ""))
+        # raw=True: a key may contain characters such as % that ConfigParser would interpolate
+        self.url = build_url(sec.get("Url", "", raw=True), sec.get("AuthKey", "", raw=True))
         self.id_tag = (sec.get("IdTag", "") or "PHOENIX").strip()[:20]
         self.require_meter = sec.getboolean("RequireMeter", True)
         self.mv_interval = max(10, sec.getint("MeterValueSampleInterval", 60))

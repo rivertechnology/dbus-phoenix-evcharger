@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -259,7 +259,7 @@ class PhoenixEvCharger:
         oc = cfg["OCPP"] if cfg.has_section("OCPP") else None
         self.ocpp = None
         if oc is not None and oc.getboolean("Enabled", False):
-            if not oc.get("Url", "").strip():
+            if not oc.get("Url", "", raw=True).strip():
                 logging.error("OCPP enabled but [OCPP] Url is empty")
             else:
                 if BASE_DIR not in sys.path:
@@ -876,7 +876,7 @@ def test_meter(cfg, args):
 
 def test_ocpp(cfg):
     """Connect once and send a BootNotification: python3 dbus-phoenix-evcharger.py --test-ocpp"""
-    if not cfg.has_section("OCPP") or not cfg["OCPP"].get("Url", "").strip():
+    if not cfg.has_section("OCPP") or not cfg["OCPP"].get("Url", "", raw=True).strip():
         print("Geen OCPP-adres: vul [OCPP] Url (en AuthKey) in config.ini in.")
         return 1
     if BASE_DIR not in sys.path:
@@ -884,7 +884,7 @@ def test_ocpp(cfg):
     import json as _json
     import ocpp_client
     sec = cfg["OCPP"]
-    url = ocpp_client.build_url(sec.get("Url", ""), sec.get("AuthKey", ""))
+    url = ocpp_client.build_url(sec.get("Url", "", raw=True), sec.get("AuthKey", "", raw=True))
     print("Verbinden met %s ..." % ocpp_client.mask_url(url))
     ws = ocpp_client.WebSocket(url)
     try:
