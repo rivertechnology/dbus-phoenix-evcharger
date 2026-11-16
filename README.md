@@ -5,6 +5,8 @@ Lightweight Venus OS (Victron GX) driver for a **Phoenix Contact EM-CP-PP-ETH** 
 - **Manual mode**: start/stop (coil 400) and charge current (holding 300) from the GX GUI
 - **Auto mode**: charge on PV surplus (grid export + battery charge power above `MinSoc`), current follows the surplus between `MinCurrent` and `MaxCurrent`, with start/stop delays, minimum runtime and off-time
 - Status from CP state (input register 100, ASCII A–F)
+- Same D-Bus paths as Victron's own EV Charging Station driver (`/Session/Energy`, `/Session/Time`, `/Ac/Energy/Forward`, `/Position`, `/AutoStart`, …), so the GX GUI shows it as an EVCS
+- Position, name and AutoStart set in the GUI are remembered (`state.json`); editing `config.ini` overrides them again
 - Optional **Eastron SDM72D-M (MID)** via a Modbus TCP gateway (`[METER]` in `config.ini`): real power, current, voltage and the meter's import kWh
 - Without a meter: power = setpoint × `CurrentFactor` × voltage × phases while in state C/D; total kWh persisted in `state.json`
 - No external Python dependencies, **no automatic updates**
@@ -43,6 +45,14 @@ sh /data/dbus-phoenix-evcharger/update.sh
 ```
 
 Downloads `main`, keeps `config.ini` and `state.json`, backs up the whole folder to `/data/dbus-phoenix-evcharger.bak`, restarts the service and lists settings that are new in `config.default.ini`. Only runs when you start it.
+
+## Check the installation
+
+```sh
+sh /data/dbus-phoenix-evcharger/check.sh
+```
+
+Read-only. Verifies service and boot hook, `config.ini`, the D-Bus paths the Victron GUI uses for an EVCS, reads the charger and the meter directly and compares them with the D-Bus, scans the last 24 h of the log, and looks for other controllers of the same charger (old drivers, Node-RED Modbus writes). A line `write enable=… (charger had …)` in the log means a second Modbus master is writing to the charger.
 
 ## Operate
 

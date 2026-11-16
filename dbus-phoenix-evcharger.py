@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 
-VERSION = "1.3.6"
+VERSION = "1.4.0"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
@@ -262,6 +262,15 @@ class PhoenixEvCharger:
         self.charging_time = float(st.get("charging_time", 0.0))
         self._saved_total = self.total_kwh
         self._last_save = time.time()
+        # Start charging by itself when a car is plugged in (Manual mode); GUI setting, persisted
+        self.autostart = 1 if int(st.get("autostart", 1)) else 0
+        # A value changed in the GUI wins over config.ini until config.ini itself is edited
+        self._overrides = st.get("overrides") if isinstance(st.get("overrides"), dict) else {}
+        self._cfg_position = d.getint("Position", 0)
+        self._cfg_name = d.get("CustomName", "Laadpaal")
+        self._overrides_dropped = False
+        self._retry_at = 0.0
+        self._meter_retry_at = 0.0
 
         a = cfg["AUTO"] if cfg.has_section("AUTO") else cfg["DEFAULT"]
         self.auto_start_w = a.getfloat("StartSurplusWatts", 0)  # 0 = minimum charge power + 300 W
@@ -313,12 +322,14 @@ class PhoenixEvCharger:
         svc.add_path("/DeviceInstance", instance)
         svc.add_path("/ProductId", 0xFFFF)
         svc.add_path("/ProductName", "Phoenix Contact EV Charger")
-        svc.add_path("/CustomName", d.get("CustomName", "Laadpaal"), writeable=True)
+        svc.add_path("/CustomName", self._setting("CustomName", self._cfg_name), writeable=True,
+                     onchangecallback=lambda p, v: self._on_setting("CustomName", self._cfg_name, str(v)))
         svc.add_path("/FirmwareVersion", VERSION)
         svc.add_path("/HardwareVersion", "EM-CP-PP-ETH")
         svc.add_path("/Serial", "")
         svc.add_path("/Connected", 0)
-        svc.add_path("/Position", d.getint("Position", 0), writeable=True)
+        svc.add_path("/Position", self._setting("Position", self._cfg_position), writeable=True,
+                     onchangecallback=self._on_position)
         svc.add_path("/Model", "EM-CP-PP-ETH")
 
         _w = lambda p, v: "%.0f W" % v if v is not None else ""
@@ -341,23 +352,25 @@ class PhoenixEvCharger:
         svc.add_path("/Meter/Serial", "")
         svc.add_path("/Current", 0, gettextcallback=_a)
         svc.add_path("/MaxCurrent", self.max_current, gettextcallback=_a)
+        svc.add_path("/MinCurrent", self.min_current, gettextcallback=_a)
         svc.add_path("/SetCurrent", self.min_current, writeable=True,
                      onchangecallback=self._on_set_current, gettextcallback=_a)
         svc.add_path("/StartStop", 0, writeable=True, onchangecallback=self._on_start_stop)
         svc.add_path("/Mode", self.mode, writeable=True, onchangecallback=self._on_mode)
         svc.add_path("/Auto/AvailableWatts", None, gettextcallback=_w)
         svc.add_path("/Auto/Reason", "")
-        svc.add_path("/AutoStart", 0, writeable=True)
+        svc.add_path("/AutoStart", self.autostart, writeable=True, onchangecallback=self._on_autostart)
         svc.add_path("/Status", ST_DISCONNECTED)
         svc.add_path("/ChargingTime", int(self.charging_time), gettextcallback=_s)
         # gui-v2 shows session energy/time from these paths
         svc.add_path("/Session/Energy", round(self.session_kwh, 3), gettextcallback=_k)
         svc.add_path("/Session/Time", int(self.charging_time), gettextcallback=_s)
-        svc.add_path("/EnableDisplay", 0, writeable=True)
         svc.add_path("/Phoenix/CpState", "")
 
         if late_register:
             svc.register()
+        if self._overrides_dropped:
+            self._save(force=True)  # config.ini was edited: forget the old GUI override for good
 
         logging.info("started %s (v%s), polling %s:%d unit %d every %d ms",
                      svc_name, VERSION, self.mb.host, self.mb.port, self.mb.unit, self.poll_ms)
@@ -370,7 +383,40 @@ class PhoenixEvCharger:
     def _clamp_current(self, value):
         return max(self.min_current, min(self.max_current, int(round(float(value)))))
 
+    def _setting(self, key, cfg_value):
+        """GUI override from state.json, dropped as soon as config.ini has a different value."""
+        o = self._overrides.get(key)
+        if isinstance(o, dict) and o.get("cfg") == cfg_value and "value" in o:
+            return o["value"]
+        if self._overrides.pop(key, None) is not None:
+            self._overrides_dropped = True
+        return cfg_value
+
+    def _on_setting(self, key, cfg_value, value):
+        self._overrides[key] = {"cfg": cfg_value, "value": value}
+        logging.info("%s -> %s (set in GUI)", key, value)
+        self._save(force=True)
+        return True
+
     # ---- D-Bus write callbacks -------------------------------------------
+    def _on_position(self, path, value):
+        try:
+            pos = int(value)
+        except (TypeError, ValueError):
+            return False
+        if pos not in (0, 1):
+            return False
+        return self._on_setting("Position", self._cfg_position, pos)
+
+    def _on_autostart(self, path, value):
+        try:
+            self.autostart = 1 if int(value) else 0
+        except (TypeError, ValueError):
+            return False
+        logging.info("AutoStart -> %d", self.autostart)
+        self._save(force=True)
+        return True
+
     def _on_start_stop(self, path, value):
         if self.mode == MODE_AUTO:
             logging.info("StartStop ignored: Auto mode is active")
@@ -540,12 +586,15 @@ class PhoenixEvCharger:
 
     def _update(self):
         now = time.time()
+        if self.failures >= self.fail_limit and now < self._retry_at:
+            return  # charger unreachable: retry every 10 s, keep the D-Bus responsive
         try:
             raw = self.mb.read_input(self.reg_status)[0]
             enabled = self.mb.read_coils(self.coil_enable)[0]
             setpoint = self.mb.read_holding(self.reg_current)[0]
         except ModbusError as e:
             self.failures += 1
+            self._retry_at = now + 10
             if self.failures == 1 or self.failures % 30 == 0:
                 logging.warning("read failed (%d): %s", self.failures, e)
             if self.failures >= self.fail_limit:
@@ -596,6 +645,7 @@ class PhoenixEvCharger:
         except ModbusError as e:
             logging.warning("write failed: %s", e)
 
+        unplugged = letter == "A" and self.last_letter in ("B", "C", "D")
         if letter != self.last_letter:
             logging.info("CP state %s -> %s", self.last_letter, letter)
             self.last_letter = letter
@@ -637,6 +687,11 @@ class PhoenixEvCharger:
             self.total_kwh += kwh
             self.session_kwh += kwh
         # Meter configured but not readable: keep energy frozen until it is back
+
+        # AutoStart off (Manual mode): after unplugging, the next car needs a manual start
+        if unplugged and self.mode == MODE_MANUAL and not self.autostart and self.desired_enable:
+            logging.info("AutoStart off: car unplugged, charging disabled until started manually")
+            self.desired_enable = False
 
         # New session when the car is unplugged
         if letter == "A" and (self.session_kwh or self.charging_time):
@@ -689,10 +744,14 @@ class PhoenixEvCharger:
     def _read_meter(self):
         if self.meter is None:
             return None
+        now = time.time()
+        if self.meter_failures >= 3 and now < self._meter_retry_at:
+            return None  # meter unreachable: retry every 10 s
         try:
             meas = self.meter.read()
         except ModbusError as e:
             self.meter_failures += 1
+            self._meter_retry_at = now + 10
             if self.meter_failures == 1 or self.meter_failures % 30 == 0:
                 logging.warning("meter read failed (%d), using calculated power: %s", self.meter_failures, e)
             self.meter_ok = False
@@ -731,6 +790,8 @@ class PhoenixEvCharger:
                 "charging_time": round(self.charging_time, 1),
                 "mode": self.mode,
                 "manual_current": self.manual_current,
+                "autostart": self.autostart,
+                "overrides": self._overrides,
                 "session_start_kwh": None if self.session_start_kwh is None else round(self.session_start_kwh, 4),
                 "saved_at": int(now),
             })
