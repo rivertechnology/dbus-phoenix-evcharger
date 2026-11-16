@@ -31,7 +31,7 @@ tar xzf "$TMP/src.tar.gz" -C "$TMP" || fail "uitpakken mislukt"
 SRC="$TMP/dbus-phoenix-evcharger-$BRANCH"
 [ -f "$SRC/dbus-phoenix-evcharger.py" ] || fail "onverwachte inhoud van het archief"
 python3 -I -m py_compile "$SRC/dbus-phoenix-evcharger.py" || fail "nieuwe versie bevat een fout"
-rm -rf "$SRC/__pycache__" "$SRC/config.ini" "$SRC/state.json"
+rm -rf "$SRC/__pycache__" "$SRC/config.ini" "$SRC/state.json" "$SRC/ocpp_state.json"
 
 OLD=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$DIR/dbus-phoenix-evcharger.py" 2>/dev/null)
 NEW=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$SRC/dbus-phoenix-evcharger.py")

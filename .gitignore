@@ -1,4 +1,6 @@
 config.ini
 state.json
 state.json.tmp
+ocpp_state.json
+ocpp_state.json.tmp
 __pycache__/

@@ -310,7 +310,42 @@ except OSError:
     warn("log niet gevonden in %s" % LOG_DIR)
 
 # --------------------------------------------------------------------------
-head("6. Andere regelaars voor deze laadpaal")
+head("6. OCPP (Joulo)")
+if not (cfg_ok and cfg.has_section("OCPP") and cfg["OCPP"].getboolean("Enabled", False)):
+    ok("OCPP staat uit")
+else:
+    oc_sec = cfg["OCPP"]
+    url = oc_sec.get("Url", "").strip()
+    if not url.startswith("wss://"):
+        (err if not url else warn)("[OCPP] Url %s" % ("ontbreekt" if not url else "gebruikt geen wss:// (onversleuteld)"))
+    has_key = bool(oc_sec.get("AuthKey", "").strip()) or ("auth=" in url and not url.endswith("auth="))
+    (ok if has_key else err)("sleutel (auth) %s" % ("ingevuld" if has_key else "ontbreekt"))
+    if not meter_host and oc_sec.getboolean("RequireMeter", True):
+        err("OCPP met RequireMeter=1 maar geen meter: er worden geen sessies doorgegeven")
+    if service:
+        conn = get(service, "/Ocpp/Connected")
+        queue = get(service, "/Ocpp/Queue")
+        tid = get(service, "/Ocpp/TransactionId")
+        if conn == 1:
+            ok("verbonden en aangemeld bij de backend%s" % (", lopende sessie %s" % tid if tid else ""))
+        elif conn is None:
+            err("draaiende versie kent geen OCPP - update en restart")
+        else:
+            err("niet verbonden met de backend - zie de log (zoek op OCPP)")
+        if queue:
+            (warn if queue < 100 else err)("%s berichten wachten op verzending (worden verstuurd zodra er verbinding is)" % queue)
+        else:
+            ok("geen achterstallige berichten")
+    try:
+        st = json.load(open(os.path.join(DIR, "ocpp_state.json")))
+        if st.get("tx"):
+            print("           lopende sessie sinds %s, start %.3f kWh" % (
+                time.strftime("%d-%m %H:%M", time.localtime(st["tx"]["start"])), st["tx"]["start_wh"] / 1000.0))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+# --------------------------------------------------------------------------
+head("7. Andere regelaars voor deze laadpaal")
 for path, what in (("/data/venus-evcharger", "oude venus-evcharger-service"),
                    ("/data/dbus-goecharger", "dbus-goecharger")):
     if os.path.isdir(path):

@@ -25,10 +25,11 @@ import struct
 import sys
 import time
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
+OCPP_STATE_PATH = os.path.join(BASE_DIR, "ocpp_state.json")
 
 VELIB_PATHS = [
     os.path.join(BASE_DIR, "ext", "velib_python"),
@@ -255,6 +256,20 @@ class PhoenixEvCharger:
         self.meter_failures = 0
         self.meter_ok = False
 
+        oc = cfg["OCPP"] if cfg.has_section("OCPP") else None
+        self.ocpp = None
+        if oc is not None and oc.getboolean("Enabled", False):
+            if not oc.get("Url", "").strip():
+                logging.error("OCPP enabled but [OCPP] Url is empty")
+            else:
+                if BASE_DIR not in sys.path:
+                    sys.path.insert(0, BASE_DIR)
+                import ocpp_client
+                self.ocpp = ocpp_client.OcppClient(oc, OCPP_STATE_PATH, {
+                    "vendor": "Phoenix Contact", "model": "EM-CP-PP-ETH",
+                    "firmware": "dbus-phoenix-evcharger " + VERSION,
+                    "meter_type": "Eastron SDM72D-M" if self.meter else ""})
+
         st = load_state()
         self.session_start_kwh = st.get("session_start_kwh")
         self.total_kwh = float(st.get("total_kwh", 0.0))
@@ -366,6 +381,10 @@ class PhoenixEvCharger:
         svc.add_path("/Session/Energy", round(self.session_kwh, 3), gettextcallback=_k)
         svc.add_path("/Session/Time", int(self.charging_time), gettextcallback=_s)
         svc.add_path("/Phoenix/CpState", "")
+        svc.add_path("/Ocpp/Enabled", 1 if self.ocpp else 0)
+        svc.add_path("/Ocpp/Connected", 0)
+        svc.add_path("/Ocpp/Queue", 0)
+        svc.add_path("/Ocpp/TransactionId", None)
 
         if late_register:
             svc.register()
@@ -374,6 +393,8 @@ class PhoenixEvCharger:
 
         logging.info("started %s (v%s), polling %s:%d unit %d every %d ms",
                      svc_name, VERSION, self.mb.host, self.mb.port, self.mb.unit, self.poll_ms)
+        if self.ocpp:
+            self.ocpp.start()
 
     # ---- helpers ---------------------------------------------------------
     def _energy_value(self):
@@ -599,6 +620,7 @@ class PhoenixEvCharger:
                 logging.warning("read failed (%d): %s", self.failures, e)
             if self.failures >= self.fail_limit:
                 self._publish_offline()
+                self._ocpp_update({"time": now, "charger_ok": False})
             self.last_update = None
             return
 
@@ -739,7 +761,24 @@ class PhoenixEvCharger:
             s["/Ac/L%d/Current" % i] = round(meas["i"][i - 1], 2) if meas else None
         s["/Meter/Connected"] = 1 if meas else 0
 
+        self._ocpp_update({
+            "time": now, "charger_ok": True, "letter": letter, "enabled": bool(enabled),
+            "meter_kwh": meas["kwh"] if meas else None,
+            "last_meter_wh": int(round(self.meter.last_kwh * 1000)) if self.meter and self.meter.last_kwh is not None else None,
+            "calc_kwh": None if self.meter else self.total_kwh,
+            "power": p_total, "currents": meas["i"] if meas else None, "voltages": meas["v"] if meas else None,
+            "meter_serial": self.meter.serial if self.meter else None})
+
         self._save()
+
+    def _ocpp_update(self, snap):
+        if not self.ocpp:
+            return
+        self.ocpp.update(snap)
+        st = self.ocpp.status()
+        self.svc["/Ocpp/Connected"] = st["connected"]
+        self.svc["/Ocpp/Queue"] = st["queue"]
+        self.svc["/Ocpp/TransactionId"] = st["tx"]
 
     def _read_meter(self):
         if self.meter is None:
@@ -799,6 +838,8 @@ class PhoenixEvCharger:
             self._last_save = now
 
     def shutdown(self):
+        if self.ocpp:
+            self.ocpp.stop()
         self._save(force=True)
         self.mb.close()
         if self.meter:
@@ -833,6 +874,66 @@ def test_meter(cfg, args):
     return 0 if ok else 1
 
 
+def test_ocpp(cfg):
+    """Connect once and send a BootNotification: python3 dbus-phoenix-evcharger.py --test-ocpp"""
+    if not cfg.has_section("OCPP") or not cfg["OCPP"].get("Url", "").strip():
+        print("Geen OCPP-adres: vul [OCPP] Url (en AuthKey) in config.ini in.")
+        return 1
+    if BASE_DIR not in sys.path:
+        sys.path.insert(0, BASE_DIR)
+    import json as _json
+    import ocpp_client
+    sec = cfg["OCPP"]
+    url = ocpp_client.build_url(sec.get("Url", ""), sec.get("AuthKey", ""))
+    print("Verbinden met %s ..." % ocpp_client.mask_url(url))
+    ws = ocpp_client.WebSocket(url)
+    try:
+        ws.connect()
+    except Exception as e:
+        print("FOUT: verbinden mislukt: %s" % e)
+        return 1
+    print("WebSocket-verbinding OK")
+    meter_serial = None
+    if cfg.has_section("METER") and cfg["METER"].get("Host", "").strip():
+        try:
+            m = Sdm72Meter(cfg["METER"])
+            meter_serial = m.read_serial()
+            m.close()
+        except Exception:
+            pass
+    boot = {"chargePointVendor": "Phoenix Contact", "chargePointModel": "EM-CP-PP-ETH",
+            "firmwareVersion": "dbus-phoenix-evcharger " + VERSION}
+    if meter_serial:
+        boot.update(meterType="Eastron SDM72D-M", meterSerialNumber=meter_serial)
+    rc = 1
+    try:
+        ws.send_text(_json.dumps([2, "test-boot", "BootNotification", boot]))
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            msg = ws.recv_text(deadline - time.time())
+            if msg is None:
+                break
+            m = _json.loads(msg)
+            if m[0] == 3 and m[1] == "test-boot":
+                print("BootNotification: %s (heartbeat %s s, servertijd %s)" % (
+                    m[2].get("status"), m[2].get("interval"), m[2].get("currentTime")))
+                rc = 0 if m[2].get("status") == "Accepted" else 1
+                break
+            if m[0] == 4 and m[1] == "test-boot":
+                print("FOUT: server weigert BootNotification: %s %s" % (m[2], m[3] if len(m) > 3 else ""))
+                break
+            if m[0] == 2:
+                print("server vraagt: %s %s" % (m[2], m[3] if len(m) > 3 else ""))
+                ws.send_text(_json.dumps([4, m[1], "NotImplemented", "test mode", {}]))
+        else:
+            print("FOUT: geen antwoord op BootNotification binnen 20 s")
+    except Exception as e:
+        print("FOUT: %s" % e)
+    finally:
+        ws.close()
+    return rc
+
+
 def main():
     cfg = configparser.ConfigParser()
     try:
@@ -854,6 +955,8 @@ def main():
         level=getattr(logging, cfg["DEFAULT"].get("Logging", "INFO").upper(), logging.INFO),
     )
 
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-ocpp":
+        sys.exit(test_ocpp(cfg))
     if len(sys.argv) > 1 and sys.argv[1] == "--test-meter":
         sys.exit(test_meter(cfg, sys.argv[2:]))
 

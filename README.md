@@ -9,6 +9,7 @@ Lightweight Venus OS (Victron GX) driver for a **Phoenix Contact EM-CP-PP-ETH** 
 - Position, name and AutoStart set in the GUI are remembered (`state.json`); editing `config.ini` overrides them again
 - Optional **Eastron SDM72D-M (MID)** via a Modbus TCP gateway (`[METER]` in `config.ini`): real power, current, voltage and the meter's import kWh
 - Without a meter: power = setpoint × `CurrentFactor` × voltage × phases while in state C/D; total kWh persisted in `state.json`
+- Optional OCPP 1.6J reporting of sessions with MID readings (e.g. to Joulo)
 - No external Python dependencies, **no automatic updates**
 
 ## Install on the GX
@@ -45,6 +46,24 @@ sh /data/dbus-phoenix-evcharger/update.sh
 ```
 
 Downloads `main`, keeps `config.ini` and `state.json`, backs up the whole folder to `/data/dbus-phoenix-evcharger.bak`, restarts the service and lists settings that are new in `config.default.ini`. Only runs when you start it.
+
+## OCPP (e.g. Joulo)
+
+Optionally reports every charging session to an OCPP 1.6J central system, with the MID meter readings in Wh: `StartTransaction` (meterStart) when the car is plugged in, `MeterValues` every minute, `StopTransaction` (meterStop) when it is unplugged. Report-only: remote start/stop from the backend is rejected, charging stays under control of the GX.
+
+```ini
+[OCPP]
+Enabled=1
+Url=wss://ocpp.joulo.nl/JL-XXXX-XXXX
+AuthKey=<key from the provider>
+```
+
+```sh
+python3 /data/dbus-phoenix-evcharger/dbus-phoenix-evcharger.py --test-ocpp   # connect + BootNotification
+sh /data/dbus-phoenix-evcharger/restart.sh
+```
+
+Messages are queued in `ocpp_state.json` and delivered in order after an internet outage or a restart, so no session is lost. The key is never written to the log. With `RequireMeter=1` (default) sessions are only reported when a meter reading is available.
 
 ## Check the installation
 
